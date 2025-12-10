@@ -78,7 +78,7 @@ input_device=/dev/input/by-id/usb-Manufacturer-Product-event-kbd
 ; Linux Input Event Codes (int)
 key_up=103
 key_down=108
-...
+```
 
 ## 5. Troubleshooting Data
 If issues arise, please provide:
@@ -149,4 +149,5 @@ key_select=42
 key_start=57
 key_opt=29
 key_edit=56
+
 ```
