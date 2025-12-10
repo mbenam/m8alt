@@ -1,68 +1,61 @@
-# PROJECT CONTEXT: M8C Embedded – Unified Specification (Combined v1 + v2.0)
+# PROJECT CONTEXT: M8C Embedded – Unified Specification (v3.0 Optimized)
 
 ## 1. Project Overview
 
-A lightweight, bare-metal C port of the **m8c** client for **Embedded Linux** (Raspberry Pi 3B+, Zero 2W, Luckfox Lyra 128MB).  
-This version replaces the original SDL3/libusb application with a minimal framebuffer and evdev-based implementation.
+A lightweight, bare-metal C port of the **m8c** client for **Embedded Linux** (Raspberry Pi, Luckfox, etc.).
+This version replaces the original SDL3 implementation with a highly optimized, direct-to-framebuffer renderer suitable for low-power ARM processors.
 
 ### Key Goals
-- Fully remove heavy dependencies (SDL3, libusb, libserialport, rtmidi).
-- Run on extremely low-end Linux hardware (as low as 128MB RAM).
-- Render directly to `/dev/fb0` without X11/Wayland.
-- Use evdev input directly (no SDL input).
-- Communicate with the M8 over raw serial + SLIP.
-
-### Removed Features (from original m8c)
-- Audio routing  
-- MIDI handling  
-- Keyjazz  
-- Screensaver  
-- In-app Settings  
-- Firmware flashing  
-
-### Display
-- Fixed 320×240 internal resolution.
-- Centered on any framebuffer size.
-- Direct software rendering (no hardware acceleration).
-- Software double buffering.
-
-### Audio (System-level, not in m8c)
-- External I2S DAC (e.g., UDA1334A).
-- Audio handled externally using `alsaloop`.
+- **Zero-Dependency:** No SDL, libusb, or X11/Wayland required.
+- **High Performance:** Runs on minimal hardware (e.g., Pi Zero 2W, single-core ARMv7).
+- **Direct Framebuffer Access:** Renders to `/dev/fb0`.
+- **Latency Optimized:** Uses dirty rectangle tracking to minimize bus traffic.
+- **Evdev Input:** Reads directly from `/dev/input/eventX`.
 
 ---
 
 ## 2. Architecture & Modules
 
-The application is **single-threaded**.  
-Main loop uses **`poll()`** to multiplex serial + input device events.
+The application is **single-threaded**. The main loop uses `poll()` to multiplex serial data and input events, while the display subsystem manages its own state and optimization logic.
 
 ---
 
 ## A. Display (`src/display.c`, `src/display.h`)
 
-### Rendering Method
-- Memory-mapped framebuffer (`mmap` `/dev/fb0`).
-- Internal buffer: `uint32_t render_buffer[320][240]` (ARGB8888).
-- Buffer is blitted → framebuffer each frame.
+### 1. Rendering Pipeline (Native Buffer)
+To eliminate conversion overhead during the critical flush phase, the renderer detects the framebuffer depth at startup:
+- **Initialization:** Detects `bits_per_pixel` via `ioctl`.
+- **Buffer Allocation:** Allocates an internal RAM buffer (`render_buffer`) matching the native screen format (16-bit RGB565 or 32-bit ARGB8888).
+- **Draw Time:** Colors are packed into the native format *once* when drawing primitives.
+- **Blit Time:** The flush operation is a raw `memcpy` (or optimized block copy), requiring zero math per pixel.
 
-### Color Format Handling
-- Detects framebuffer format via `ioctl(FBIOGET_VSCREENINFO)`.
-- Converts ARGB8888 →  
-  - **RGB565**, or  
-  - **BGRA/ARGB** (depending on FB ordering).
+### 2. Dirty Rectangle Tracking
+Instead of redrawing the full 320x240 screen every frame:
+- The system tracks `min_x`, `min_y`, `max_x`, and `max_y` of any pixel modified during a frame.
+- **Aggressive Padding:** A safety margin (2px horizontal, 6px vertical) is added to dirty regions to ensure font "tails" and vertical offsets are correctly cleared, preventing artifacts.
+- **Optimization:** If no pixels change, `display_blit` returns immediately.
 
-### Software Rasterizer
-Implements:
-- `draw_rect`
-- `draw_char` (1-bit font bitmap)
-- `draw_waveform` using **Bresenham line algorithm**
+### 3. Artifact Prevention & Logic
+- **Font Offsets:** Text is drawn with a vertical offset (defined in font headers).
+- **Absolute vs. Relative Clears:**
+  - **Text/Cursors:** Drawn relative to the font offset.
+  - **Clears (Black/Background):** Detected by color (`0x00` or `global_bg_color`). These are treated as absolute coordinates to ensure the entire line/screen is wiped clean, fixing "ghosting" artifacts from previous screens.
+- **Space Character (ASCII 32):** Explicitly draws a background-colored rectangle to erase underlying text.
 
-### Critical Fixes (from Version 2.0)
-- **screen_offset_y logic** applied for rectangle erases.
-- **Full-screen clear** triggered when M8 sends `(x=0,y=0)` rectangle.
-- **Waveform cleanup**: background wipe of oscilloscope region before drawing.
-- **Ghosting fixes** for bottom rows and waveform pane.
+### 4. VSync & Tearing
+- Uses `ioctl(fb_fd, FBIO_WAITFORVSYNC, ...)` to synchronize updates with the display refresh rate, preventing horizontal tearing on rapid waveform updates.
+
+### 5. Drawing Primitives
+- **`display_draw_char`:** 
+  - Inlined bitmap parsing (no helper function overhead).
+  - Direct bit-shift extraction from font data.
+  - Writes directly to the native pointer (pointer arithmetic) rather than array indexing.
+- **`display_draw_rect`:**
+  - Uses `memset` for black/clear operations for maximum speed.
+  - Uses pointer increment loops for colored rectangles.
+- **`display_draw_waveform`:**
+  - Bresenham's line algorithm.
+  - Clears only the specific column/area used by the previous frame's waveform before drawing the new one.
 
 ---
 
@@ -70,128 +63,86 @@ Implements:
 
 ### Method
 - Reads `struct input_event` from `/dev/input/eventX`.
+- Non-blocking read loop.
 
 ### Mapping
 Converts Linux keycodes → M8 bitmask:
-- Left = 0x80  
-- Up = 0x40  
-- Down = 0x20  
-- Select = 0x10  
-- Start = 0x08  
-- Right = 0x04  
-- Opt = 0x02  
-- Edit = 0x01  
+- **Bit 7:** Left
+- **Bit 6:** Up
+- **Bit 5:** Down
+- **Bit 4:** Select (Shift)
+- **Bit 3:** Start (Space)
+- **Bit 2:** Right
+- **Bit 1:** Opt (Ctrl)
+- **Bit 0:** Edit (Alt)
 
 ### Behavior
-- Sends `0x43` (Control command) when any key changes.
-- Uses mapping defined in `config.ini`.
+- State changes trigger a Serial Write (`0x43` + byte).
+- Debouncing is handled implicitly by the Linux kernel evdev driver.
 
 ---
 
 ## C. Serial / Protocol (`src/serial.c`, `src/slip.c`)
 
-### Serial Setup
-- Device: `/dev/ttyACM0`
-- Configuration: **115200 baud, 8N1, raw**
-- POSIX `termios`
+### Configuration
+- **Device:** `/dev/ttyACM0` (Configurable via `config.ini`).
+- **Settings:** 115200 baud, 8N1, Raw mode.
 
-### Protocol
-- SLIP packet decoding via `slip.c`.
-- Initial handshake:
-  - `'D'` = Disconnect  
-  - `'E'` = Enable Display  
-  - `'R'` = Reset  
-
-### Commands Supported
-- `0xFE`: Draw Rectangle  
-- `0xFD`: Draw Character  
-- `0xFC`: Draw Oscilloscope  
-- `0xFF`: System Info (distinguishes M8 Model:01 vs Model:02 → font offset)
-
-### Stateful Color Fix (v2.0)
-- Maintains **running color state**:
-  static uint8_t last_r, last_g, last_b;
-- Allows rectangles with no color data to reuse last color.
-- Fixes “white bar” artifact.
+### Protocol Handling
+- **SLIP Decoding:** Byte-stream decoding via `slip.c`.
+- **Command Handling:**
+  - `0xFE`: Draw Rectangle (Updates dirty rects).
+  - `0xFD`: Draw Character (Updates dirty rects).
+  - `0xFC`: Draw Oscilloscope (Updates dirty rects).
+  - `0xFF`: System Info (Used to select Font offsets).
+- **Stateful Colors:** Maintains the last received RGB value to optimize bandwidth (M8 sends compressed commands without color if it hasn't changed).
 
 ---
 
 ## D. Fonts (`src/fonts/`)
 
-### Source
-- Uses original M8C font headers: `font1.h ... font5.h`.
-
-### Implementation Notes
-- **fonts.c is excluded** to avoid multiple definitions.
-- `display.c` directly includes the header arrays.
-- Bitmap parsing skips the **54-byte BMP header** embedded in the data.
-- Fonts are 1-bit depth bitmaps.
+- Headers: `font1.h` through `font5.h`.
+- Implementation: Included directly into `display.c` to allow the compiler to inline data access.
+- **Note:** Bitmap headers are parsed manually in `display_draw_char` to skip the 54-byte BMP header and jump straight to pixel data.
 
 ---
 
-## 3. Directory Structure
-
-```text
-m8c-embedded/
-├── Makefile       (Excludes fonts.c → prevents duplicate symbols)
-├── config.ini     (Serial/FB/Input paths + key mapping)
-└── src/
-    ├── main.c     (Main loop, config reader, poll() loop)
-    ├── common.h   (Shared constants)
-    ├── display.c  (Framebuffer rendering + fonts)
-    ├── input.c    (Evdev → M8 bitmask)
-    ├── serial.c   (SLIP + stateful protocol handler)
-    ├── slip.c     (SLIP decoding)
-    ├── ini.c      (Config parser)
-    └── fonts/     (font1.h ... font5.h)
-```
-
----
-
-## 4. Configuration Format (`config.ini`)
+## 3. Configuration (`config.ini`)
 
 ```ini
 [system]
 serial_device=/dev/ttyACM0
 framebuffer_device=/dev/fb0
-; Prefer by-id for stability, but event0 is valid on Lyra
-input_device=/dev/input/by-id/usb-Manufacturer-Product-event-kbd
-; or:
-; input_device=/dev/input/event0
+input_device=/dev/input/event0
 
 [keyboard]
-; Linux Input Event Codes (int)
+; Standard Linux Keycodes
 key_up=103
 key_down=108
 key_left=105
 key_right=106
-key_select=42
-key_start=57
-key_opt=29
-key_edit=56
+key_select=42  ; Left Shift
+key_start=57   ; Space
+key_opt=29     ; Left Ctrl
+key_edit=56    ; Left Alt
 ```
 
 ---
 
-## 5. Troubleshooting Checklist
+## 4. Compile & Run
 
-### When reporting issues, include:
+### Dependencies
+- Standard C Library (libc).
+- Linux Headers (for `linux/fb.h`, `linux/input.h`).
 
-### A. Error Output
-- Any compile-time errors
-- Any runtime log messages
-
-### B. Input Device Check
-```
-ls -l /dev/input/by-id/
+### Build
+```bash
+make
 ```
 
-### C. Framebuffer Check
+### Execution
+```bash
+./m8alt
 ```
-fbset -i
-```
+*(Requires read/write permissions for `/dev/fb0`, `/dev/ttyACM0`, and `/dev/input/eventX`)*.
 
-### D. Serial Check
-```
-dmesg | grep tty
-```
