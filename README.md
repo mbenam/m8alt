@@ -30,7 +30,6 @@ A lightweight, bare-metal C implementation of the M8 headless display client opt
 If you are using a 2.4" or 2.8" ILI9341 SPI display (common for handheld builds) on a Raspberry Pi, follow these steps.
 
 ### 1. Wiring Diagram
-Connect the display to the Pi's GPIO header using the following pinout:
 
 | ILI9341 Pin | RPi Pin Name | RPi Physical Pin |
 | :--- | :--- | :--- |
@@ -42,54 +41,72 @@ Connect the display to the Pi's GPIO header using the following pinout:
 | **SDI** (MOSI) | SPI0 MOSI | Pin 19 (GPIO 10) |
 | **SCK** (Clock) | SPI0 SCLK | Pin 23 (GPIO 11) |
 | **LED** (Backlight) | 3.3V or GPIO 18 | Pin 1 or Pin 12 (PWM) |
-| **SDO** (MISO) | SPI0 MISO | Pin 21 (GPIO 9) - *Optional* |
 
-### 2. Enable SPI
-1. Run `sudo raspi-config`.
-2. Navigate to **Interface Options** > **SPI**.
-3. Select **Yes** to enable.
-4. Finish and reboot.
-
-### 3. Software Configuration (fbtft)
-This enables the built-in Linux kernel driver for SPI displays.
-1. Open the boot config file:
-   - *Newer OS (Bookworm):* `sudo nano /boot/firmware/config.txt`
-   - *Older OS (Bullseye):* `sudo nano /boot/config.txt`
-2. Add the following line to the bottom:
+### 2. Enable SPI & Driver
+1. Enable SPI via `sudo raspi-config` (**Interface Options** > **SPI**).
+2. Add the following line to `/boot/firmware/config.txt` (or `/boot/config.txt`):
    ```bash
    dtoverlay=fbtft,spi0-0,ili9341,rotate=270,speed=32000000,fps=30,dc_pin=24,reset_pin=25
    ```
-   *(Note: Adjust `rotate` to 90, 180, or 270 to match your physical orientation).*
-3. Save and Reboot. The screen should now initialize and be accessible via `/dev/fb1`.
+3. Reboot. Your display should now be available at `/dev/fb1`.
+
+---
+
+## Architecture & Modules
+
+The application is single-threaded for deterministic performance. The main loop uses `poll()` to multiplex serial data from the M8 and input events from `evdev`, while the display subsystem manages its own state and optimization logic.
+
+### A. Display (src/display.c, src/display.h)
+
+#### 1. Rendering Pipeline (Native Buffer)
+To eliminate conversion overhead during the critical flush phase, the renderer detects the framebuffer depth at startup:
+- **Initialization**: Detects `bits_per_pixel` (16 or 32) via `ioctl`.
+- **Buffer Allocation**: Allocates an internal RAM buffer (`render_buffer`) matching the native screen format (**RGB565** or **ARGB8888**).
+- **Draw Time**: Colors are packed into the native format **once** when drawing primitives.
+- **Blit Time**: The flush operation is a raw `memcpy` (or optimized block copy), requiring zero math per pixel.
+
+#### 2. Dirty Rectangle Tracking
+Instead of redrawing the full 320x240 screen every frame:
+- The system tracks `min_x`, `min_y`, `max_x`, and `max_y` of any pixel modified during a frame.
+- **Aggressive Padding**: A safety margin (2px horizontal, 6px vertical) is added to dirty regions to ensure font "tails" and vertical offsets are correctly cleared, preventing artifacts.
+- **Optimization**: If no pixels change, `display_blit` returns immediately.
+
+#### 3. Artifact Prevention & Logic
+- **Font Offsets**: Text is drawn with a vertical offset defined in the font headers.
+- **Absolute vs. Relative Clears**: 
+    - **Text/Cursors**: Drawn relative to the font offset.
+    - **Clears (Black/Background)**: Detected by color (0x00 or global background). These are treated as **absolute coordinates** to ensure the entire line/screen is wiped clean, fixing "ghosting" artifacts during screen transitions.
+- **Space Character (ASCII 32)**: Explicitly draws a background-colored rectangle to erase underlying text.
+- **VSync**: Uses `ioctl(fb_fd, FBIO_WAITFORVSYNC, ...)` to synchronize with the display refresh rate, preventing horizontal tearing on rapid waveform updates.
+
+#### 4. Drawing Primitives
+- **display_draw_char**: Features inlined bitmap parsing and direct bit-shift extraction. It writes directly to native pointers using pointer arithmetic rather than array indexing.
+- **display_draw_rect**: Uses `memset` for black/clear operations for maximum speed and pointer increment loops for colored rectangles.
+- **display_draw_waveform**: Implements **Bresenham's line algorithm**. It clears only the specific column/area used by the previous frame's waveform before drawing the new one.
 
 ---
 
 ## Quick Start
 
-### 1. Install Build Tools
+### 1. Build
 **Debian/Ubuntu/Raspberry Pi OS:**
 ```bash
-sudo apt-get update
 sudo apt-get install musl-tools make gcc
-```
-
-### 2. Build
-```bash
 git clone <repository>
 cd m8alt
-make clean && make
+make
 ```
 
-### 3. Configure
-Edit `config.ini` to match your hardware. If using the SPI display configured above, change the framebuffer device:
+### 2. Configure
+Edit `config.ini`:
 ```ini
 [system]
-serial_device=/dev/ttyACM0      # M8 USB serial port
-framebuffer_device=/dev/fb1     # Use /dev/fb1 for SPI displays
-input_device=/dev/input/event4  # Keyboard/gamepad
+serial_device=/dev/ttyACM0      # M8 USB
+framebuffer_device=/dev/fb1     # Use fb1 for SPI, fb0 for HDMI
+input_device=/dev/input/event4  # Check via 'evtest'
 ```
 
-### 4. Run
+### 3. Run
 ```bash
 sudo ./m8alt
 ```
@@ -98,35 +115,19 @@ sudo ./m8alt
 
 ## Compilation & Makefile Flags
 
-Building a static binary with `musl-gcc` on a system that primarily uses `glibc` requires specific compiler flags to find Linux kernel headers without causing library conflicts.
-
-### Key Flags Explained
-- `-static`: Forces the linker to include all library code within the binary.
-- `-Isrc`: Adds the project's source directory to the header search path.
-- `-idirafter /usr/include`: Crucial for finding `linux/fb.h` and `linux/input.h` without mixing glibc headers.
-- `-idirafter /usr/include/$(shell gcc -dumpmachine)`: Points to architecture-specific headers (like `asm/ioctl.h`).
+Building a static binary with `musl-gcc` on glibc-based systems requires:
+- `-static`: Includes all library code within the binary.
+- `-idirafter /usr/include`: Allows access to `linux/fb.h` and `linux/input.h` without causing glibc header conflicts.
 
 ---
 
 ## Configuration Reference
 
-### System Settings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `serial_device` | `/dev/ttyACM0` | M8 USB serial port. |
-| `framebuffer_device` | `/dev/fb0` | `/dev/fb0` = HDMI, `/dev/fb1` = SPI/Small LCD. |
-| `input_device` | `/dev/input/event0` | Input event device for keyboard/controller. |
-
-### Keyboard Mapping
-Default mapping uses standard Linux input event codes:
+### Keyboard Mapping (Default)
 
 | M8 Function | Key | Event Code |
 |-------------|-----|------------|
-| **Up** | Arrow Up | 103 |
-| **Down** | Arrow Down | 108 |
-| **Left** | Arrow Left | 105 |
-| **Right** | Arrow Right | 106 |
+| **Up / Down / Left / Right** | Arrow Keys | 103, 108, 105, 106 |
 | **Select** | Left Shift | 42 |
 | **Start** | Space | 57 |
 | **Opt** | Left Ctrl | 29 |
@@ -134,51 +135,20 @@ Default mapping uses standard Linux input event codes:
 
 ---
 
-## Architecture & Performance
-
-### Rendering Pipeline
-- **Native Format Rendering**: Detects depth (RGB565/ARGB8888) and packs colors once.
-- **Dirty Rectangle Optimization**: Only modified regions are copied to the framebuffer.
-- **VSync Prevention**: Uses `FBIO_WAITFORVSYNC` to eliminate tearing.
-
-### Input Processing
-- Single-threaded with `poll()` multiplexing.
-- Sub-millisecond latency from keypress to M8.
-
----
-
 ## Troubleshooting
-
-### M8 Not Connecting
-```bash
-dmesg | grep tty
-# Should show: cdc_acm 1-1:1.0: ttyACM0: USB ACM device
-```
 
 ### Display Issues
 **Black Screen:**
 ```bash
-# Check if framebuffer is accessible
+# Test the framebuffer directly
 cat /dev/urandom > /dev/fb1
-# Should show noise on the SPI screen
 ```
-
 **Wrong Colors:**
-- Supports RGB565 (16-bit) and ARGB8888 (32-bit).
-- Check `fbset -i` output for `bits_per_pixel`.
-
----
-
-## Performance Benchmarks
-**Raspberry Pi Zero 2W:**
-- Frame Time: ~2-4ms.
-- Input Latency: <1ms.
-- CPU Usage: ~15-20% (single core).
+- Supports RGB565 (16-bit) and ARGB8888 (32-bit). Check `fbset -i`.
 
 ---
 
 ## License
-This project incorporates:
 - **SLIP decoder**: MIT (Marcin Borowicz).
 - **INI parser**: MIT (rxi).
 - **Original m8c**: MIT.
@@ -186,6 +156,5 @@ This project incorporates:
 ---
 
 ## Known Limitations
-- **Single M8 Support**: Only one M8 connection at a time.
-- **No Audio Routing**: Display/input only.
+- **No Audio Routing**: This is a display/input client only.
 - **Fixed Resolution**: 320×240 native.
