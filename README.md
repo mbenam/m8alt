@@ -7,7 +7,7 @@ A lightweight, bare-metal C implementation of the M8 headless display client opt
 **m8alt** is a stripped-down port of the m8c client designed specifically for resource-constrained embedded systems. It provides:
 
 - **Zero Dependencies**: No SDL, libusb, X11, or Wayland required.
-- **Direct Framebuffer Access**: Renders to `/dev/fb0` with hardware-accelerated vsync.
+- **Direct Framebuffer Access**: Renders to `/dev/fb0` or `/dev/fb1` with hardware-accelerated vsync.
 - **Static Binary**: Compiled with `musl-libc` for portability across embedded Linux systems.
 - **High Performance**: Optimized for single-core ARMv7 processors.
 - **Low Latency**: Dirty rectangle tracking minimizes bus traffic.
@@ -18,17 +18,55 @@ A lightweight, bare-metal C implementation of the M8 headless display client opt
 ## Hardware Requirements
 
 ### Minimum Specifications
-- **CPU**: ARMv7 or newer (tested on BCM2710 - Pi Zero 2W).
+- **CPU**: ARMv7 or newer (tested on BCM2710 - Pi Zero 2W, BCM2837 - Pi 3B+).
 - **RAM**: 32MB+.
 - **Display**: Framebuffer-compatible display (HDMI, SPI LCD, etc.).
 - **Serial**: USB connection to Dirtywave M8 Tracker.
 
 ---
 
+## SPI Display Setup (ILI9341)
+
+If you are using a 2.4" or 2.8" ILI9341 SPI display (common for handheld builds) on a Raspberry Pi, follow these steps.
+
+### 1. Wiring Diagram
+Connect the display to the Pi's GPIO header using the following pinout:
+
+| ILI9341 Pin | RPi Pin Name | RPi Physical Pin |
+| :--- | :--- | :--- |
+| **VCC** | 3.3V | Pin 1 or 17 |
+| **GND** | Ground | Pin 6, 9, 14, 20, or 25 |
+| **CS** (Chip Select) | SPI0 CE0 | Pin 24 (GPIO 8) |
+| **RESET** | GPIO 25 | Pin 22 |
+| **DC** (Data/Command) | GPIO 24 | Pin 18 |
+| **SDI** (MOSI) | SPI0 MOSI | Pin 19 (GPIO 10) |
+| **SCK** (Clock) | SPI0 SCLK | Pin 23 (GPIO 11) |
+| **LED** (Backlight) | 3.3V or GPIO 18 | Pin 1 or Pin 12 (PWM) |
+| **SDO** (MISO) | SPI0 MISO | Pin 21 (GPIO 9) - *Optional* |
+
+### 2. Enable SPI
+1. Run `sudo raspi-config`.
+2. Navigate to **Interface Options** > **SPI**.
+3. Select **Yes** to enable.
+4. Finish and reboot.
+
+### 3. Software Configuration (fbtft)
+This enables the built-in Linux kernel driver for SPI displays.
+1. Open the boot config file:
+   - *Newer OS (Bookworm):* `sudo nano /boot/firmware/config.txt`
+   - *Older OS (Bullseye):* `sudo nano /boot/config.txt`
+2. Add the following line to the bottom:
+   ```bash
+   dtoverlay=fbtft,spi0-0,ili9341,rotate=270,speed=32000000,fps=30,dc_pin=24,reset_pin=25
+   ```
+   *(Note: Adjust `rotate` to 90, 180, or 270 to match your physical orientation).*
+3. Save and Reboot. The screen should now initialize and be accessible via `/dev/fb1`.
+
+---
+
 ## Quick Start
 
 ### 1. Install Build Tools
-
 **Debian/Ubuntu/Raspberry Pi OS:**
 ```bash
 sudo apt-get update
@@ -36,7 +74,6 @@ sudo apt-get install musl-tools make gcc
 ```
 
 ### 2. Build
-
 ```bash
 git clone <repository>
 cd m8alt
@@ -44,18 +81,15 @@ make clean && make
 ```
 
 ### 3. Configure
-
-Edit `config.ini` to match your hardware:
-
+Edit `config.ini` to match your hardware. If using the SPI display configured above, change the framebuffer device:
 ```ini
 [system]
 serial_device=/dev/ttyACM0      # M8 USB serial port
-framebuffer_device=/dev/fb0     # HDMI or SPI display
+framebuffer_device=/dev/fb1     # Use /dev/fb1 for SPI displays
 input_device=/dev/input/event4  # Keyboard/gamepad
 ```
 
 ### 4. Run
-
 ```bash
 sudo ./m8alt
 ```
@@ -64,17 +98,13 @@ sudo ./m8alt
 
 ## Compilation & Makefile Flags
 
-Building a static binary with `musl-gcc` on a system that primarily uses `glibc` (like Raspberry Pi OS) requires specific compiler flags to find Linux kernel headers without causing library conflicts.
+Building a static binary with `musl-gcc` on a system that primarily uses `glibc` requires specific compiler flags to find Linux kernel headers without causing library conflicts.
 
 ### Key Flags Explained
-
-- `-static`: Forces the linker to include all library code within the binary. This ensures the resulting `m8alt` file can run on any Linux system (even those without musl installed).
+- `-static`: Forces the linker to include all library code within the binary.
 - `-Isrc`: Adds the project's source directory to the header search path.
-- `-idirafter /usr/include`: **Crucial Flag.** `musl-gcc` intentionally ignores the standard `/usr/include` directory to prevent mixing incompatible glibc headers. However, we need Linux-specific headers (`linux/fb.h` and `linux/input.h`). This flag tells the compiler to search the system path *only as a last resort* if it cannot find the header in the musl environment.
-- `-idirafter /usr/include/$(shell gcc -dumpmachine)`: Points the compiler to architecture-specific headers (like `asm/ioctl.h`) required by the Linux framebuffer and input subsystems.
-
-### Troubleshooting Build Errors
-If you see an error like `fatal error: bits/libc-header-start.h`, it means the compiler is accidentally trying to use glibc headers. Ensure you are using `-idirafter` instead of `-isystem` or `-I` for the `/usr/include` directories.
+- `-idirafter /usr/include`: Crucial for finding `linux/fb.h` and `linux/input.h` without mixing glibc headers.
+- `-idirafter /usr/include/$(shell gcc -dumpmachine)`: Points to architecture-specific headers (like `asm/ioctl.h`).
 
 ---
 
@@ -84,12 +114,11 @@ If you see an error like `fatal error: bits/libc-header-start.h`, it means the c
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `serial_device` | `/dev/ttyACM0` | M8 USB serial port (check `dmesg` after plugging in M8). |
-| `framebuffer_device` | `/dev/fb0` | Display device (`/dev/fb0` = HDMI, `/dev/fb1` often = SPI). |
+| `serial_device` | `/dev/ttyACM0` | M8 USB serial port. |
+| `framebuffer_device` | `/dev/fb0` | `/dev/fb0` = HDMI, `/dev/fb1` = SPI/Small LCD. |
 | `input_device` | `/dev/input/event0` | Input event device for keyboard/controller. |
 
 ### Keyboard Mapping
-
 Default mapping uses standard Linux input event codes:
 
 | M8 Function | Key | Event Code |
@@ -103,45 +132,18 @@ Default mapping uses standard Linux input event codes:
 | **Opt** | Left Ctrl | 29 |
 | **Edit** | Left Alt | 56 |
 
-**Find Event Codes:**
-```bash
-sudo evtest /dev/input/event4
-# Press keys to see their codes
-```
-
 ---
 
 ## Architecture & Performance
 
 ### Rendering Pipeline
-
-**Native Format Rendering:**
-- Detects framebuffer depth at startup (16-bit RGB565 or 32-bit ARGB8888).
-- Allocates internal buffer matching native pixel format.
-- Colors are packed **once** during draw operations.
-- Blit phase is a raw `memcpy` with zero per-pixel conversion overhead.
-
-**Dirty Rectangle Optimization:**
-- Tracks modified regions per frame (`min_x`, `min_y`, `max_x`, `max_y`).
-- Only modified regions are copied to framebuffer.
-- Full-screen updates only when necessary (screen transitions).
-
-**VSync Prevention:**
-- Uses `FBIO_WAITFORVSYNC` ioctl to synchronize with display refresh.
-- Eliminates horizontal tearing on waveform updates.
+- **Native Format Rendering**: Detects depth (RGB565/ARGB8888) and packs colors once.
+- **Dirty Rectangle Optimization**: Only modified regions are copied to the framebuffer.
+- **VSync Prevention**: Uses `FBIO_WAITFORVSYNC` to eliminate tearing.
 
 ### Input Processing
-
-**Event Loop:**
 - Single-threaded with `poll()` multiplexing.
-- Non-blocking reads on serial and input file descriptors.
 - Sub-millisecond latency from keypress to M8.
-
----
-
-## Font System
-
-Five embedded bitmap fonts are selected automatically based on M8's `CMD_SYSTEM_INFO` response to ensure correct rendering for both M8 v1 and v2 hardware/firmware versions.
 
 ---
 
@@ -157,39 +159,33 @@ dmesg | grep tty
 **Black Screen:**
 ```bash
 # Check if framebuffer is accessible
-cat /dev/urandom > /dev/fb0
-# Should show noise on the screen
+cat /dev/urandom > /dev/fb1
+# Should show noise on the SPI screen
 ```
 
 **Wrong Colors:**
 - Supports RGB565 (16-bit) and ARGB8888 (32-bit).
-- Automatically detects format via `ioctl`.
 - Check `fbset -i` output for `bits_per_pixel`.
 
 ---
 
 ## Performance Benchmarks
-
-**Raspberry Pi Zero 2W (1GHz Quad-Core ARM Cortex-A53):**
+**Raspberry Pi Zero 2W:**
 - Frame Time: ~2-4ms.
-- Input Latency: <1ms (evdev to M8).
+- Input Latency: <1ms.
 - CPU Usage: ~15-20% (single core).
-- Memory: ~8MB RSS.
 
 ---
 
 ## License
-
 This project incorporates:
-- **SLIP decoder**: MIT License (Marcin Borowicz).
-- **INI parser**: MIT License (rxi).
-- **Original m8c**: MIT License.
+- **SLIP decoder**: MIT (Marcin Borowicz).
+- **INI parser**: MIT (rxi).
+- **Original m8c**: MIT.
 
 ---
 
 ## Known Limitations
-
 - **Single M8 Support**: Only one M8 connection at a time.
-- **No Audio Routing**: This is a display/input client only.
-- **Fixed Resolution**: 320×240 native, no scaling.
-- **Linux Only**: Requires Linux framebuffer and evdev subsystems.
+- **No Audio Routing**: Display/input only.
+- **Fixed Resolution**: 320×240 native.
