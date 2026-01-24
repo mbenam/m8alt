@@ -1,6 +1,8 @@
+This updated README preserves all your original documentation while adding the necessary details for the new audio passthrough, power management, and TinyALSA requirements.
+
 # M8 Headless Client (Embedded)
 
-A lightweight, bare-metal C implementation of the M8 headless display client optimized for **Embedded Linux** devices (Raspberry Pi Zero 2W, Luckfox Pico, etc.). This version replaces SDL dependencies with direct framebuffer rendering for maximum performance on low-power ARM processors.
+A lightweight, bare-metal C implementation of the M8 headless display client optimized for **Embedded Linux** devices (Raspberry Pi Zero 2W, Luckfox Pico, etc.). This version replaces SDL dependencies with direct framebuffer rendering for maximum performance on low-power ARM processors and includes integrated audio passthrough.
 
 ## Overview
 
@@ -8,9 +10,10 @@ A lightweight, bare-metal C implementation of the M8 headless display client opt
 
 - **Zero Dependencies**: No SDL, libusb, X11, or Wayland required.
 - **Direct Framebuffer Access**: Renders to `/dev/fb0` or `/dev/fb1` with hardware-accelerated vsync.
+- **Integrated Audio Routing**: Passthrough from M8 USB to I2S/USB DAC via `tinyalsa`.
 - **Static Binary**: Compiled with `musl-libc` for portability across embedded Linux systems.
 - **High Performance**: Optimized for single-core ARMv7 processors.
-- **Low Latency**: Dirty rectangle tracking minimizes bus traffic.
+- **Low Latency**: Dirty rectangle tracking minimizes bus traffic; Real-Time audio threading.
 - **Evdev Input**: Direct `/dev/input/eventX` reading for minimal overhead.
 
 ---
@@ -22,6 +25,42 @@ A lightweight, bare-metal C implementation of the M8 headless display client opt
 - **RAM**: 32MB+.
 - **Display**: Framebuffer-compatible display (HDMI, SPI LCD, etc.).
 - **Serial**: USB connection to Dirtywave M8 Tracker.
+
+---
+
+## Audio Passthrough Setup
+
+m8alt handles audio routing internally, capturing the 44.1kHz stream from the M8 and piping it directly to your output device.
+
+### 1. Identify your devices
+Check the internal names of your audio hardware (the strings inside the brackets):
+```bash
+cat /proc/asound/cards
+```
+*Example output:*
+` 0 [M8             ]: USB-Audio - M8`
+` 1 [UDA1334        ]: USB-Audio - UDA1334`
+
+### 2. Configure `config.ini`
+Set the `input_device_name` and `output_device_name` in the `[audio]` section. The app uses these strings for dynamic card discovery.
+
+---
+
+## Power Management & Single Core Optimization
+
+For handheld builds where battery life is critical, m8alt can be optimized for single-core operation.
+
+### 1. Force Single Core
+Add `maxcpus=1` to the end of your `/boot/cmdline.txt`. 
+
+### 2. Underclocking (config.txt)
+Lowering frequency reduces power draw:
+`arm_freq=800`
+`sdram_freq=400`
+`over_voltage=-2`
+
+### 3. Priority & Build
+When running on a single core, ensure the `Makefile` has `AUDIO_CORE = none`. m8alt uses `SCHED_FIFO` (Real-Time priority) for audio. **You must run m8alt with `sudo`** for this priority to take effect, ensuring audio interrupts the display renderer to prevent crackling.
 
 ---
 
@@ -54,7 +93,7 @@ If you are using a 2.4" or 2.8" ILI9341 SPI display (common for handheld builds)
 
 ## Architecture & Modules
 
-The application is single-threaded for deterministic performance. The main loop uses `poll()` to multiplex serial data from the M8 and input events from `evdev`, while the display subsystem manages its own state and optimization logic.
+The application uses a high-priority background thread for audio and a main loop using `poll()` to multiplex serial data from the M8 and input events from `evdev`.
 
 ### A. Display (src/display.c, src/display.h)
 
@@ -84,12 +123,24 @@ Instead of redrawing the full 320x240 screen every frame:
 - **display_draw_rect**: Uses `memset` for black/clear operations for maximum speed and pointer increment loops for colored rectangles.
 - **display_draw_waveform**: Implements **Bresenham's line algorithm**. It clears only the specific column/area used by the previous frame's waveform before drawing the new one.
 
+### B. Audio (src/audio.c, src/audio.h)
+- **TinyALSA v1.1.1**: Direct kernel PCM interaction with minimal overhead.
+- **Real-Time Thread**: Operates at 44100Hz with `SCHED_FIFO` priority.
+- **Dynamic Discovery**: Parses `/proc/asound/cards` to find hardware card numbers by name.
+
 ---
 
 ## Quick Start
 
 ### 1. Build
-**Debian/Ubuntu/Raspberry Pi OS:**
+**TinyALSA Requirements:**
+You must place the following v1.1.1 TinyALSA files in your source tree:
+- `src/pcm.c`
+- `src/tinyalsa/asoundlib.h`
+- `src/tinyalsa/pcm.h`
+- `src/tinyalsa/mixer.h`
+
+**Compile:**
 ```bash
 sudo apt-get install musl-tools make gcc
 git clone <repository>
@@ -104,6 +155,13 @@ Edit `config.ini`:
 serial_device=/dev/ttyACM0      # M8 USB
 framebuffer_device=/dev/fb1     # Use fb1 for SPI, fb0 for HDMI
 input_device=/dev/input/event4  # Check via 'evtest'
+
+[audio]
+enabled=1
+input_device_name=M8
+output_device_name=UDA1334
+period_size=256
+period_count=4
 ```
 
 ### 3. Run
@@ -117,6 +175,7 @@ sudo ./m8alt
 
 Building a static binary with `musl-gcc` on glibc-based systems requires:
 - `-static`: Includes all library code within the binary.
+- `-lpthread`: Required for the audio passthrough thread.
 - `-idirafter /usr/include`: Allows access to `linux/fb.h` and `linux/input.h` without causing glibc header conflicts.
 
 ---
@@ -137,6 +196,11 @@ Building a static binary with `musl-gcc` on glibc-based systems requires:
 
 ## Troubleshooting
 
+### Audio Issues
+**Crackling/Pops:**
+- Ensure you are running with `sudo` to enable Real-Time priority.
+- Increase `period_size` to `512` in `config.ini`.
+
 ### Display Issues
 **Black Screen:**
 ```bash
@@ -149,6 +213,7 @@ cat /dev/urandom > /dev/fb1
 ---
 
 ## License
+- **TinyALSA**: BSD-3-Clause.
 - **SLIP decoder**: MIT (Marcin Borowicz).
 - **INI parser**: MIT (rxi).
 - **Original m8c**: MIT.
@@ -156,5 +221,5 @@ cat /dev/urandom > /dev/fb1
 ---
 
 ## Known Limitations
-- **No Audio Routing**: This is a display/input client only.
 - **Fixed Resolution**: 320×240 native.
+
