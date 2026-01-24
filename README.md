@@ -1,5 +1,3 @@
-This updated README preserves all your original documentation while adding the necessary details for the new audio passthrough, power management, and TinyALSA requirements.
-
 # M8 Headless Client (Embedded)
 
 A lightweight, bare-metal C implementation of the M8 headless display client optimized for **Embedded Linux** devices (Raspberry Pi Zero 2W, Luckfox Pico, etc.). This version replaces SDL dependencies with direct framebuffer rendering for maximum performance on low-power ARM processors and includes integrated audio passthrough.
